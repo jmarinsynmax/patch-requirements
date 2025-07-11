@@ -7,51 +7,70 @@ set -e
 
 # Function to display usage information
 usage() {
-    echo "Usage: $0 -o <organization> -p <package> -v <minimum_version> [-m] [-y]"
+    echo "Usage: $0 -o <organization> -p <package> -r <target_version> [-v <minimum_version>] [-y] [--main]"
     echo "  -o: GitHub organization name"
     echo "  -p: Package name to check and update"
-    echo "  -v: Minimum version required"
-    echo "  -m: Only update packages on the same major version"
+    echo "  -r: Target version to update packages to (mandatory)"
+    echo "  -v: Minimum version required for qualification (optional, if not set all packages qualify)"
     echo "  -y: Auto-approve all changes (skip user confirmation)"
+    echo "  --main: Use main branch strategy (create PR and auto-merge). Default is dev branch strategy"
     echo "  -h: Display this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0 -o myorg -p requests -r 2.28.0                    # Update all packages to 2.28.0"
+    echo "  $0 -o myorg -p requests -r 11.3.0 -v 11.2.0          # Update packages >= 11.2.0 to 11.3.0"
+    echo "  $0 -o myorg -p requests -r 11.3.0 -v 11.2.0 --main   # Same but use main branch strategy"
+    echo ""
+    echo "Note: If -v is specified, only packages >= minimum version will be updated."
     exit 1
 }
 
+# Initialize variables
+USE_MAIN_STRATEGY=false
+TARGET_VERSION_ARG=""
+MIN_VERSION=""
+
 # Process command line arguments
-while getopts "o:p:v:myh" opt; do
-    case ${opt} in
-        o)
-            ORG=$OPTARG
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -o)
+            ORG="$2"
+            shift 2
             ;;
-        p)
-            PACKAGE=$OPTARG
+        -p)
+            PACKAGE="$2"
+            shift 2
             ;;
-        v)
-            MIN_VERSION=$OPTARG
+        -v)
+            MIN_VERSION="$2"
+            shift 2
             ;;
-        m)
-            MAJOR_VERSION_CHECK=true
+        -r)
+            TARGET_VERSION_ARG="$2"
+            shift 2
             ;;
-        y)
+        -y)
             AUTO_APPROVE=true
+            shift
             ;;
-        h)
+        --main)
+            USE_MAIN_STRATEGY=true
+            shift
+            ;;
+        -h)
             usage
             ;;
-        \?)
-            echo "Invalid option: $OPTARG" 1>&2
-            usage
-            ;;
-        :)
-            echo "Option -$OPTARG requires an argument." 1>&2
+        *)
+            echo "Unknown option: $1" 1>&2
             usage
             ;;
     esac
 done
 
 # Check if required arguments are provided
-if [ -z "$ORG" ] || [ -z "$PACKAGE" ] || [ -z "$MIN_VERSION" ]; then
+if [ -z "$ORG" ] || [ -z "$PACKAGE" ] || [ -z "$TARGET_VERSION_ARG" ]; then
     echo "Error: Missing required arguments."
+    echo "Required: -o (organization), -p (package), -r (target version)"
     usage
 fi
 
@@ -114,18 +133,34 @@ for REPO in $REPOS; do
     
     cd "$REPO"
     
-    # Check if dev branch exists
-    if ! git ls-remote --heads origin dev | grep -q dev; then
-        echo "dev branch not found in $ORG/$REPO. Skipping."
-        continue
+    # Determine which branch to work with based on strategy
+    WORKING_BRANCH=""
+    if [ "$USE_MAIN_STRATEGY" = true ]; then
+        # Use main branch strategy - look for main branch
+        if git ls-remote --heads origin main | grep -q main; then
+            WORKING_BRANCH="main"
+            echo "Using main branch strategy. Working with branch: $WORKING_BRANCH"
+        else
+            echo "Main branch not found in $ORG/$REPO and using main strategy. Skipping repository."
+            continue
+        fi
+    else
+        # Use dev branch strategy - only work with dev branch, skip if it doesn't exist
+        if git ls-remote --heads origin dev | grep -q dev; then
+            WORKING_BRANCH="dev"
+            echo "Using dev branch strategy. Working with branch: $WORKING_BRANCH"
+        else
+            echo "Dev branch not found in $ORG/$REPO and using dev strategy. Skipping repository."
+            continue
+        fi
     fi
     
-    # Checkout dev branch
-    git checkout dev > /dev/null 2>&1
+    # Checkout the working branch
+    git checkout "$WORKING_BRANCH" > /dev/null 2>&1
     
     # Check if requirements.txt exists
     if [ ! -f "requirements.txt" ]; then
-        echo "requirements.txt not found in dev branch of $ORG/$REPO. Skipping."
+        echo "requirements.txt not found in $WORKING_BRANCH branch of $ORG/$REPO. Skipping."
         continue
     fi
     
@@ -156,37 +191,67 @@ for REPO in $REPOS; do
         fi
     }
     
-    # Function to extract major version number
-    get_major_version() {
-        echo "$1" | sed 's/[^0-9.].*$//' | cut -d. -f1
+    # Function to compare versions (greater than)
+    version_gt() {
+        # Remove any characters after the version number
+        local v1=$(echo "$1" | sed 's/[^0-9.].*$//')
+        local v2=$(echo "$2" | sed 's/[^0-9.].*$//')
+        
+        # Compare versions
+        if [ "$(printf '%s\n' "$v1" "$v2" | sort -V | tail -n1)" = "$v1" ] && [ "$v1" != "$v2" ]; then
+            return 0  # v1 > v2
+        else
+            return 1  # v1 <= v2
+        fi
     }
     
-    # Check if current version is less than minimum version
-    if version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
-        echo "Current version $CURRENT_VERSION is less than minimum required version $MIN_VERSION."
-        
-        # Check major version compatibility if -m flag is set
-        if [ "$MAJOR_VERSION_CHECK" = true ]; then
-            CURRENT_MAJOR=$(get_major_version "$CURRENT_VERSION")
-            MIN_MAJOR=$(get_major_version "$MIN_VERSION")
-            
-            if [ "$CURRENT_MAJOR" != "$MIN_MAJOR" ]; then
-                echo "Major version mismatch: current major version is $CURRENT_MAJOR, minimum required major version is $MIN_MAJOR."
-                echo "Skipping update due to -m flag (major version check enabled)."
-                continue
-            else
-                echo "Major version check passed: both versions are on major version $CURRENT_MAJOR."
-            fi
+    # Check if current version needs to be updated
+    NEEDS_UPDATE=false
+    UPDATE_REASON=""
+    TARGET_VERSION="$TARGET_VERSION_ARG"
+    
+    # First check if package is already at target version
+    if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
+        NEEDS_UPDATE=false
+        echo "Package $PACKAGE is already at target version $TARGET_VERSION. Skipping."
+    elif [ -n "$MIN_VERSION" ]; then
+        # Minimum version is specified - check qualification
+        if version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
+            # Package is below minimum version - not qualified for update
+            NEEDS_UPDATE=false
+            echo "Package $PACKAGE version $CURRENT_VERSION is below minimum version $MIN_VERSION. Not qualified for update."
+        else
+            # Package meets minimum version requirement
+            NEEDS_UPDATE=true
+            UPDATE_REASON="Package $PACKAGE version $CURRENT_VERSION is qualified (>= $MIN_VERSION) and will be updated to $TARGET_VERSION"
         fi
+    else
+        # No minimum version specified - all packages qualify (except those already at target)
+        NEEDS_UPDATE=true
+        UPDATE_REASON="Package $PACKAGE version $CURRENT_VERSION will be updated to $TARGET_VERSION (no minimum version restriction)"
+    fi
+    
+    if [ "$NEEDS_UPDATE" = true ]; then
+        echo "$UPDATE_REASON."
         
         # Create a new branch for the update
-        BRANCH_NAME="dev-update-$PACKAGE-to-$MIN_VERSION"
-        git checkout -b "$BRANCH_NAME"
+        BRANCH_NAME="update-$PACKAGE-to-$TARGET_VERSION"
+        
+        # Handle different branch strategies
+        if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
+            echo "Using main branch strategy - will create PR and auto-merge..."
+            # Create a feature branch from main
+            git checkout -b "$BRANCH_NAME"
+        else
+            echo "Using dev branch strategy - will commit directly to $WORKING_BRANCH..."
+            # For dev strategy, commit directly to the current branch (no new branch needed)
+            BRANCH_NAME="$WORKING_BRANCH"
+        fi
         
         # Update the package version in requirements.txt
-        echo "Updating $PACKAGE to version $MIN_VERSION..."
+        echo "Updating $PACKAGE to version $TARGET_VERSION..."
         # Use more precise sed command with word boundaries to ensure exact package name matching
-        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[0-9][0-9.]*/${PACKAGE}==${MIN_VERSION}/" requirements.txt
+        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[0-9][0-9.]*/${PACKAGE}==${TARGET_VERSION}/" requirements.txt
         rm -f requirements.txt.bak
         
         # Show diff for review
@@ -202,31 +267,58 @@ for REPO in $REPOS; do
         fi
         
         if [ "$APPROVE" = "y" ] || [ "$APPROVE" = "Y" ]; then
-            # Commit and push changes
+            # Commit changes
             git add requirements.txt
-            git commit -m "Update $PACKAGE to $MIN_VERSION to fix vulnerability"
+            git commit -m "Update $PACKAGE to $TARGET_VERSION to fix vulnerability"
             
-            if git push -u origin "$BRANCH_NAME"; then
-                echo "Changes pushed to branch $BRANCH_NAME in $ORG/$REPO."
-                
-                # Create a pull request
-                echo "Creating pull request..."
-                PR_TITLE="Update $PACKAGE to $MIN_VERSION"
-                PR_BODY="This PR updates $PACKAGE from $CURRENT_VERSION to $MIN_VERSION to fix a security vulnerability."
-                
-                if PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base dev --head "$BRANCH_NAME"); then
-                    echo "Pull request created: $PR_URL"
+            if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
+                # For main branch strategy: push feature branch, create PR, and auto-merge
+                if git push -u origin "$BRANCH_NAME"; then
+                    echo "Changes pushed to branch $BRANCH_NAME in $ORG/$REPO."
+                    
+                    # Create a pull request
+                    echo "Creating pull request..."
+                    PR_TITLE="Update $PACKAGE to $TARGET_VERSION"
+                    if [ -n "$MIN_VERSION" ]; then
+                        PR_BODY="This PR updates $PACKAGE from $CURRENT_VERSION to $TARGET_VERSION (qualified package >= $MIN_VERSION) to fix a security vulnerability."
+                    else
+                        PR_BODY="This PR updates $PACKAGE from $CURRENT_VERSION to $TARGET_VERSION to fix a security vulnerability."
+                    fi
+                    
+                    if PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME"); then
+                        echo "Pull request created: $PR_URL"
+                        
+                        # Auto-merge the PR
+                        echo "Auto-merging pull request..."
+                        if gh pr merge "$PR_URL" --merge --auto; then
+                            echo "Pull request auto-merged successfully."
+                            
+                            # Clean up the feature branch
+                            echo "Cleaning up feature branch..."
+                            git checkout main
+                            git pull origin main
+                            git branch -d "$BRANCH_NAME" 2>/dev/null || true
+                            git push origin --delete "$BRANCH_NAME" 2>/dev/null || true
+                        else
+                            echo "Failed to auto-merge pull request. Please merge manually: $PR_URL"
+                        fi
+                    else
+                        echo "Failed to create pull request."
+                    fi
                 else
-                    echo "Failed to create pull request."
+                    echo "Failed to push changes to $ORG/$REPO."
                 fi
             else
-                echo "Failed to push changes to $ORG/$REPO."
+                # For dev branch strategy: push directly to the branch
+                if git push origin "$WORKING_BRANCH"; then
+                    echo "Changes pushed directly to $WORKING_BRANCH branch in $ORG/$REPO."
+                else
+                    echo "Failed to push changes to $ORG/$REPO."
+                fi
             fi
         else
             echo "Changes not approved. Skipping."
         fi
-    else
-        echo "Package $PACKAGE already meets or exceeds minimum version requirement ($MIN_VERSION). Skipping."
     fi
     
     echo "Finished processing $ORG/$REPO."
