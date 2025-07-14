@@ -13,7 +13,7 @@ usage() {
     echo "  -r: Target version to update packages to (mandatory)"
     echo "  -v: Minimum version required for qualification (optional, if not set all packages qualify)"
     echo "  -y: Auto-approve all changes (skip user confirmation)"
-    echo "  --main: Use main branch strategy (create PR and auto-merge). Default is dev branch strategy"
+    echo "  --main: Use main branch strategy (create PR for manual merge). Default is dev branch strategy"
     echo "  -h: Display this help message"
     echo ""
     echo "Examples:"
@@ -239,7 +239,7 @@ for REPO in $REPOS; do
         
         # Handle different branch strategies
         if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
-            echo "Using main branch strategy - will create PR and auto-merge..."
+            echo "Using main branch strategy - will create PR for manual merge..."
             # Create a feature branch from main
             git checkout -b "$BRANCH_NAME"
         else
@@ -272,7 +272,7 @@ for REPO in $REPOS; do
             git commit -m "Update $PACKAGE to $TARGET_VERSION to fix vulnerability"
             
             if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
-                # For main branch strategy: push feature branch, create PR, and auto-merge
+                # For main branch strategy: push feature branch and create PR (no auto-merge)
                 if git push -u origin "$BRANCH_NAME"; then
                     echo "Changes pushed to branch $BRANCH_NAME in $ORG/$REPO."
                     
@@ -287,21 +287,7 @@ for REPO in $REPOS; do
                     
                     if PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME"); then
                         echo "Pull request created: $PR_URL"
-                        
-                        # Auto-merge the PR
-                        echo "Auto-merging pull request..."
-                        if gh pr merge "$PR_URL" --merge --auto; then
-                            echo "Pull request auto-merged successfully."
-                            
-                            # Clean up the feature branch
-                            echo "Cleaning up feature branch..."
-                            git checkout main
-                            git pull origin main
-                            git branch -d "$BRANCH_NAME" 2>/dev/null || true
-                            git push origin --delete "$BRANCH_NAME" 2>/dev/null || true
-                        else
-                            echo "Failed to auto-merge pull request. Please merge manually: $PR_URL"
-                        fi
+                        echo "Note: The PR has been created for manual review and merge."
                     else
                         echo "Failed to create pull request."
                     fi
