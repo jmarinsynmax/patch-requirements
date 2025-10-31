@@ -289,76 +289,67 @@ print_success "Found $(echo "$REPOS" | wc -l | tr -d ' ') repositories."
 for REPO in $REPOS; do
     print_header "Processing repository: $ORG/$REPO"
     
-    # Clone the repository to the temporary directory
-    print_info "Cloning repository..."
-    cd "$TEMP_DIR"
-    if ! gh repo clone "$ORG/$REPO" "$REPO" 2>/dev/null; then
-        print_error "Failed to clone repository $ORG/$REPO. Skipping."
-        continue
-    fi
-    
-    cd "$REPO"
-    
-    # Determine which branch to work with based on strategy
+    # Determine which branch to check based on strategy
     WORKING_BRANCH=""
     if [ "$USE_MAIN_STRATEGY" = true ]; then
-        # Use main branch strategy - look for main branch
-        if git ls-remote --heads origin main | grep -q main; then
-            WORKING_BRANCH="main"
-            print_info "Using main branch strategy. Working with branch: $WORKING_BRANCH"
-        else
-            print_warning "Main branch not found in $ORG/$REPO and using main strategy. Skipping repository."
-            continue
-        fi
+        WORKING_BRANCH="main"
     else
-        # Use dev branch strategy - only work with dev branch, skip if it doesn't exist
-        if git ls-remote --heads origin dev | grep -q dev; then
-            WORKING_BRANCH="dev"
-            print_info "Using dev branch strategy. Working with branch: $WORKING_BRANCH"
-        else
-            print_warning "Dev branch not found in $ORG/$REPO and using dev strategy. Skipping repository."
-            continue
-        fi
+        WORKING_BRANCH="dev"
     fi
     
-    # Checkout the working branch
-    git checkout "$WORKING_BRANCH" > /dev/null 2>&1
+    # Check if the working branch exists before cloning
+    print_info "Checking if $WORKING_BRANCH branch exists..."
+    if ! gh api "repos/$ORG/$REPO/branches/$WORKING_BRANCH" &> /dev/null; then
+        print_warning "$WORKING_BRANCH branch not found in $ORG/$REPO. Skipping repository."
+        continue
+    fi
+    print_success "$WORKING_BRANCH branch exists."
     
-    # Check if requirements.txt exists
-    if [ ! -f "requirements.txt" ]; then
-        print_warning "requirements.txt not found in $WORKING_BRANCH branch of $ORG/$REPO. Skipping."
+    # Check if requirements.txt exists in the working branch before cloning
+    print_info "Checking if requirements.txt exists in $WORKING_BRANCH branch..."
+    if ! gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$WORKING_BRANCH" &> /dev/null; then
+        print_warning "requirements.txt not found in $WORKING_BRANCH branch of $ORG/$REPO. Skipping repository."
+        continue
+    fi
+    print_success "requirements.txt found in $WORKING_BRANCH branch."
+    
+    # Fetch and analyze requirements.txt content via API to check if updates are needed
+    print_info "Scanning requirements.txt for packages that need updating..."
+    REQUIREMENTS_CONTENT=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$WORKING_BRANCH" --jq '.content' | base64 -d 2>/dev/null)
+    
+    if [ -z "$REQUIREMENTS_CONTENT" ]; then
+        print_error "Failed to fetch requirements.txt content. Skipping repository."
         continue
     fi
     
-    # Track if any changes were made in this repository
-    REPO_HAS_CHANGES=false
-    UPDATED_PACKAGES=()
+    # Track which packages need updating
+    PACKAGES_NEED_UPDATE=false
+    PACKAGES_TO_UPDATE_IN_REPO=()
     
-    # Process each package in the list
+    # Check each package to see if it needs updating
     for PACKAGE_ENTRY in "${PACKAGES_TO_UPDATE[@]}"; do
         # Parse package name and target version
         PACKAGE=$(echo "$PACKAGE_ENTRY" | cut -d':' -f1)
         TARGET_VERSION=$(echo "$PACKAGE_ENTRY" | cut -d':' -f2)
         
-        print_color "$CYAN" "---"
-        print_color "$CYAN" "Checking package: $PACKAGE (target: $TARGET_VERSION)"
+        print_color "$CYAN" "  → Checking package: $PACKAGE (target: $TARGET_VERSION)"
         
         # Check if the package exists in requirements.txt - making sure to match exact package name
-        if ! grep -q "^${PACKAGE}[[:space:]]*[=]" requirements.txt; then
-            print_warning "Package $PACKAGE not found in requirements.txt. Skipping this package."
+        if ! echo "$REQUIREMENTS_CONTENT" | grep -q "^${PACKAGE}[[:space:]]*[=]"; then
+            print_warning "    Package $PACKAGE not found in requirements.txt. Skipping this package."
             continue
         fi
         
         # Get current version of the package - use exact package matching
-        CURRENT_LINE=$(grep -E "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
+        CURRENT_LINE=$(echo "$REQUIREMENTS_CONTENT" | grep -E "^${PACKAGE}[[:space:]]*[=]")
         CURRENT_VERSION=$(echo "$CURRENT_LINE" | sed -E "s/^${PACKAGE}[[:space:]]*==?//")
         # Trim any whitespace
         CURRENT_VERSION=$(echo "$CURRENT_VERSION" | tr -d '[:space:]')
-        print_info "Current version of $PACKAGE: $CURRENT_VERSION"
+        print_info "    Current version: $CURRENT_VERSION"
         
         # Check if package is already at target version
         if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
-            print_success "Package $PACKAGE is already at target version $TARGET_VERSION. Skipping."
+            print_success "    Already at target version. Skipping."
             continue
         fi
         
@@ -380,14 +371,54 @@ for REPO in $REPOS; do
             
             if version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
                 # Package is below minimum version - not qualified for update
-                print_warning "Package $PACKAGE version $CURRENT_VERSION is below minimum version $MIN_VERSION. Not qualified for update."
+                print_warning "    Version $CURRENT_VERSION is below minimum $MIN_VERSION. Not qualified."
                 continue
             else
-                print_color "$GREEN$BOLD" "Package $PACKAGE version $CURRENT_VERSION is qualified (>= $MIN_VERSION) and will be updated to $TARGET_VERSION"
+                print_color "$GREEN" "    ✓ Qualified (>= $MIN_VERSION). Will update to $TARGET_VERSION"
             fi
         else
-            print_color "$GREEN$BOLD" "Package $PACKAGE version $CURRENT_VERSION will be updated to $TARGET_VERSION"
+            print_color "$GREEN" "    ✓ Will update from $CURRENT_VERSION to $TARGET_VERSION"
         fi
+        
+        PACKAGES_NEED_UPDATE=true
+        PACKAGES_TO_UPDATE_IN_REPO+=("$PACKAGE:$CURRENT_VERSION:$TARGET_VERSION")
+    done
+    
+    # Skip cloning if no packages need updating
+    if [ "$PACKAGES_NEED_UPDATE" = false ]; then
+        print_info "No packages need updating in this repository. Skipping clone."
+        continue
+    fi
+    
+    print_success "Found ${#PACKAGES_TO_UPDATE_IN_REPO[@]} package(s) that need updating. Proceeding with clone..."
+    
+    # Clone the repository to the temporary directory
+    print_info "Cloning repository..."
+    cd "$TEMP_DIR"
+    if ! gh repo clone "$ORG/$REPO" "$REPO" 2>/dev/null; then
+        print_error "Failed to clone repository $ORG/$REPO. Skipping."
+        continue
+    fi
+    
+    cd "$REPO"
+    
+    # Checkout the working branch
+    print_info "Using branch: $WORKING_BRANCH"
+    git checkout "$WORKING_BRANCH" > /dev/null 2>&1
+    
+    # Track if any changes were made in this repository
+    REPO_HAS_CHANGES=false
+    UPDATED_PACKAGES=()
+    
+    # Process each package that needs updating
+    for PACKAGE_INFO in "${PACKAGES_TO_UPDATE_IN_REPO[@]}"; do
+        # Parse package info
+        PACKAGE=$(echo "$PACKAGE_INFO" | cut -d':' -f1)
+        CURRENT_VERSION=$(echo "$PACKAGE_INFO" | cut -d':' -f2)
+        TARGET_VERSION=$(echo "$PACKAGE_INFO" | cut -d':' -f3)
+        
+        print_color "$CYAN" "---"
+        print_color "$CYAN" "Updating package: $PACKAGE ($CURRENT_VERSION → $TARGET_VERSION)"
         
         # Update the package version in requirements.txt
         print_info "Updating $PACKAGE to version $TARGET_VERSION..."
