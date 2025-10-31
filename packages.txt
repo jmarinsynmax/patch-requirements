@@ -1,0 +1,7 @@
+# Example packages file for multi-package mode
+# Format: package_name, version
+# Lines starting with # are ignored
+# Empty lines are also ignored
+
+fastapi, 0.120.4
+starlette, 0.49.1

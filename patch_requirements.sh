@@ -58,25 +58,36 @@ print_pr_link() {
 
 # Function to display usage information
 usage() {
-    print_color "$WHITE$BOLD" "Usage: $0 -o <organization> -p <package> -r <target_version> [-v <minimum_version>] [-y] [--main]"
+    print_color "$WHITE$BOLD" "Usage: $0 -o <organization> [-p <package> -r <target_version> [-v <minimum_version>] | -f <packages_file>] [-y] [--main]"
     echo
     print_color "$YELLOW" "Required Arguments:"
     print_color "$WHITE" "  -o: GitHub organization name"
+    echo
+    print_color "$YELLOW" "Single Package Mode:"
     print_color "$WHITE" "  -p: Package name to check and update"
     print_color "$WHITE" "  -r: Target version to update packages to"
+    print_color "$WHITE" "  -v: Minimum version required for qualification (optional)"
+    echo
+    print_color "$YELLOW" "Multi-Package Mode:"
+    print_color "$WHITE" "  -f: Path to file containing package,version pairs (one per line)"
+    print_color "$WHITE" "      Format: package_name, version"
+    print_color "$WHITE" "      Example file contents:"
+    print_color "$WHITE" "        fastapi, 0.120.4"
+    print_color "$WHITE" "        starlette, 0.49.1"
     echo
     print_color "$YELLOW" "Optional Arguments:"
-    print_color "$WHITE" "  -v: Minimum version required for qualification (if not set, all packages qualify)"
     print_color "$WHITE" "  -y: Auto-approve all changes (skip user confirmation)"
     print_color "$WHITE" "  --main: Use main branch strategy (create PR for manual merge). Default is dev branch strategy"
     print_color "$WHITE" "  -h: Display this help message"
     echo
     print_color "$CYAN" "Examples:"
-    print_color "$WHITE" "  $0 -o myorg -p requests -r 2.28.0                    # Update all packages to 2.28.0"
+    print_color "$WHITE" "  $0 -o myorg -p requests -r 2.28.0                    # Update single package to 2.28.0"
     print_color "$WHITE" "  $0 -o myorg -p requests -r 11.3.0 -v 11.2.0          # Update packages >= 11.2.0 to 11.3.0"
     print_color "$WHITE" "  $0 -o myorg -p requests -r 11.3.0 -v 11.2.0 --main   # Same but use main branch strategy"
+    print_color "$WHITE" "  $0 -o myorg -f packages.txt                          # Update multiple packages from file"
+    print_color "$WHITE" "  $0 -o myorg -f packages.txt --main -y                # Update multiple packages (auto-approve)"
     echo
-    print_color "$YELLOW" "Note: If -v is specified, only packages >= minimum version will be updated."
+    print_color "$YELLOW" "Note: Use either single package mode (-p -r) or multi-package mode (-f), not both."
     exit 1
 }
 
@@ -84,6 +95,7 @@ usage() {
 USE_MAIN_STRATEGY=false
 TARGET_VERSION_ARG=""
 MIN_VERSION=""
+PACKAGES_FILE=""
 
 # Process command line arguments
 while [[ $# -gt 0 ]]; do
@@ -102,6 +114,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -r)
             TARGET_VERSION_ARG="$2"
+            shift 2
+            ;;
+        -f)
+            PACKAGES_FILE="$2"
             shift 2
             ;;
         -y)
@@ -123,17 +139,52 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Check if required arguments are provided
-if [ -z "$ORG" ] || [ -z "$PACKAGE" ] || [ -z "$TARGET_VERSION_ARG" ]; then
-    print_error "Missing required arguments."
-    print_warning "Required: -o (organization), -p (package), -r (target version)"
+if [ -z "$ORG" ]; then
+    print_error "Missing required argument: organization (-o)"
     usage
 fi
 
-# Check if package name is reasonable (to avoid partial matches)
-if [ ${#PACKAGE} -lt 2 ]; then
-    print_error "Package name '$PACKAGE' is too short and might cause incorrect matches."
-    print_warning "Please provide a more specific package name."
-    exit 1
+# Validate that either single package mode or multi-package mode is used
+if [ -n "$PACKAGES_FILE" ]; then
+    # Multi-package mode
+    if [ -n "$PACKAGE" ] || [ -n "$TARGET_VERSION_ARG" ] || [ -n "$MIN_VERSION" ]; then
+        print_error "Cannot use -f (packages file) together with -p, -r, or -v options."
+        print_warning "Use either single package mode (-p -r) or multi-package mode (-f), not both."
+        usage
+    fi
+    
+    # Check if file exists and is readable
+    if [ ! -f "$PACKAGES_FILE" ]; then
+        print_error "Packages file not found: $PACKAGES_FILE"
+        exit 1
+    fi
+    
+    if [ ! -r "$PACKAGES_FILE" ]; then
+        print_error "Cannot read packages file: $PACKAGES_FILE"
+        exit 1
+    fi
+    
+    print_info "Running in multi-package mode with file: $PACKAGES_FILE"
+else
+    # Single package mode
+    if [ -z "$PACKAGE" ] || [ -z "$TARGET_VERSION_ARG" ]; then
+        print_error "Missing required arguments for single package mode."
+        print_warning "Required: -p (package) and -r (target version)"
+        print_info "Or use -f to specify a packages file for multi-package mode."
+        usage
+    fi
+    
+    print_info "Running in single package mode"
+fi
+
+# For single package mode, validate package name length
+if [ -n "$PACKAGE" ]; then
+    # Check if package name is reasonable (to avoid partial matches)
+    if [ ${#PACKAGE} -lt 2 ]; then
+        print_error "Package name '$PACKAGE' is too short and might cause incorrect matches."
+        print_warning "Please provide a more specific package name."
+        exit 1
+    fi
 fi
 
 # Check if gh is installed
@@ -161,6 +212,67 @@ cleanup() {
 
 # Register cleanup function to run on exit
 trap cleanup EXIT
+
+# Function to parse packages file and return array of package,version pairs
+parse_packages_file() {
+    local file=$1
+    declare -a packages_array
+    
+    print_info "Parsing packages file: $file"
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip empty lines and comments
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -z "$line" ] || [[ "$line" =~ ^# ]]; then
+            continue
+        fi
+        
+        # Parse package and version (expecting format: package, version or package,version)
+        if [[ "$line" =~ ^([^,]+),(.+)$ ]]; then
+            local pkg=$(echo "${BASH_REMATCH[1]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            local ver=$(echo "${BASH_REMATCH[2]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            
+            if [ -z "$pkg" ] || [ -z "$ver" ]; then
+                print_warning "Skipping invalid line: $line"
+                continue
+            fi
+            
+            # Validate package name length
+            if [ ${#pkg} -lt 2 ]; then
+                print_warning "Skipping package '$pkg' - name too short"
+                continue
+            fi
+            
+            packages_array+=("$pkg:$ver")
+            print_success "Loaded: $pkg -> $ver"
+        else
+            print_warning "Skipping invalid line format: $line"
+        fi
+    done < "$file"
+    
+    if [ ${#packages_array[@]} -eq 0 ]; then
+        print_error "No valid package entries found in $file"
+        exit 1
+    fi
+    
+    print_success "Loaded ${#packages_array[@]} package(s) from file"
+    
+    # Return the array (by printing it)
+    printf '%s\n' "${packages_array[@]}"
+}
+
+# Load packages based on mode
+if [ -n "$PACKAGES_FILE" ]; then
+    # Multi-package mode: load packages from file
+    # Compatible with Bash 3.2+ (macOS default)
+    PACKAGES_TO_UPDATE=()
+    while IFS= read -r line; do
+        PACKAGES_TO_UPDATE+=("$line")
+    done < <(parse_packages_file "$PACKAGES_FILE")
+else
+    # Single package mode: create array with single entry
+    PACKAGES_TO_UPDATE=("$PACKAGE:$TARGET_VERSION_ARG")
+fi
 
 # Get list of repositories in the organization
 print_info "Fetching repositories from organization: $ORG"
@@ -218,98 +330,97 @@ for REPO in $REPOS; do
         continue
     fi
     
-    # Check if the package exists in requirements.txt - making sure to match exact package name
-    if ! grep -q "^${PACKAGE}[[:space:]]*[=]" requirements.txt; then
-        print_warning "Package $PACKAGE not found in requirements.txt. Skipping."
-        continue
-    fi
+    # Track if any changes were made in this repository
+    REPO_HAS_CHANGES=false
+    UPDATED_PACKAGES=()
     
-    # Get current version of the package - use exact package matching
-    CURRENT_LINE=$(grep -E "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
-    CURRENT_VERSION=$(echo "$CURRENT_LINE" | sed -E "s/^${PACKAGE}[[:space:]]*==?//")
-    # Trim any whitespace
-    CURRENT_VERSION=$(echo "$CURRENT_VERSION" | tr -d '[:space:]')
-    print_info "Current version of $PACKAGE: $CURRENT_VERSION"
-    
-    # Function to compare versions (handles simple version formats)
-    version_lt() {
-        # Remove any characters after the version number
-        local v1=$(echo "$1" | sed 's/[^0-9.].*$//')
-        local v2=$(echo "$2" | sed 's/[^0-9.].*$//')
+    # Process each package in the list
+    for PACKAGE_ENTRY in "${PACKAGES_TO_UPDATE[@]}"; do
+        # Parse package name and target version
+        PACKAGE=$(echo "$PACKAGE_ENTRY" | cut -d':' -f1)
+        TARGET_VERSION=$(echo "$PACKAGE_ENTRY" | cut -d':' -f2)
         
-        # Compare versions
-        if [ "$(printf '%s\n' "$v1" "$v2" | sort -V | head -n1)" = "$v1" ] && [ "$v1" != "$v2" ]; then
-            return 0  # v1 < v2
-        else
-            return 1  # v1 >= v2
+        print_color "$CYAN" "---"
+        print_color "$CYAN" "Checking package: $PACKAGE (target: $TARGET_VERSION)"
+        
+        # Check if the package exists in requirements.txt - making sure to match exact package name
+        if ! grep -q "^${PACKAGE}[[:space:]]*[=]" requirements.txt; then
+            print_warning "Package $PACKAGE not found in requirements.txt. Skipping this package."
+            continue
         fi
-    }
-    
-    # Function to compare versions (greater than)
-    version_gt() {
-        # Remove any characters after the version number
-        local v1=$(echo "$1" | sed 's/[^0-9.].*$//')
-        local v2=$(echo "$2" | sed 's/[^0-9.].*$//')
         
-        # Compare versions
-        if [ "$(printf '%s\n' "$v1" "$v2" | sort -V | tail -n1)" = "$v1" ] && [ "$v1" != "$v2" ]; then
-            return 0  # v1 > v2
-        else
-            return 1  # v1 <= v2
+        # Get current version of the package - use exact package matching
+        CURRENT_LINE=$(grep -E "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
+        CURRENT_VERSION=$(echo "$CURRENT_LINE" | sed -E "s/^${PACKAGE}[[:space:]]*==?//")
+        # Trim any whitespace
+        CURRENT_VERSION=$(echo "$CURRENT_VERSION" | tr -d '[:space:]')
+        print_info "Current version of $PACKAGE: $CURRENT_VERSION"
+        
+        # Check if package is already at target version
+        if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
+            print_success "Package $PACKAGE is already at target version $TARGET_VERSION. Skipping."
+            continue
         fi
-    }
-    
-    # Check if current version needs to be updated
-    NEEDS_UPDATE=false
-    UPDATE_REASON=""
-    TARGET_VERSION="$TARGET_VERSION_ARG"
-    
-    # First check if package is already at target version
-    if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
-        NEEDS_UPDATE=false
-        print_success "Package $PACKAGE is already at target version $TARGET_VERSION. Skipping."
-    elif [ -n "$MIN_VERSION" ]; then
-        # Minimum version is specified - check qualification
-        if version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
-            # Package is below minimum version - not qualified for update
-            NEEDS_UPDATE=false
-            print_warning "Package $PACKAGE version $CURRENT_VERSION is below minimum version $MIN_VERSION. Not qualified for update."
-        else
-            # Package meets minimum version requirement
-            NEEDS_UPDATE=true
-            UPDATE_REASON="Package $PACKAGE version $CURRENT_VERSION is qualified (>= $MIN_VERSION) and will be updated to $TARGET_VERSION"
-        fi
-    else
-        # No minimum version specified - all packages qualify (except those already at target)
-        NEEDS_UPDATE=true
-        UPDATE_REASON="Package $PACKAGE version $CURRENT_VERSION will be updated to $TARGET_VERSION (no minimum version restriction)"
-    fi
-    
-    if [ "$NEEDS_UPDATE" = true ]; then
-        print_color "$GREEN$BOLD" "$UPDATE_REASON."
         
-        # Create a new branch for the update
-        BRANCH_NAME="update-$PACKAGE-to-$TARGET_VERSION"
-        
-        # Handle different branch strategies
-        if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
-            print_info "Using main branch strategy - will create PR for manual merge..."
-            # Create a feature branch from main
-            git checkout -b "$BRANCH_NAME"
+        # Check if minimum version requirement applies (only in single package mode)
+        if [ -n "$MIN_VERSION" ]; then
+            # Function to compare versions (handles simple version formats)
+            version_lt() {
+                # Remove any characters after the version number
+                local v1=$(echo "$1" | sed 's/[^0-9.].*$//')
+                local v2=$(echo "$2" | sed 's/[^0-9.].*$//')
+                
+                # Compare versions
+                if [ "$(printf '%s\n' "$v1" "$v2" | sort -V | head -n1)" = "$v1" ] && [ "$v1" != "$v2" ]; then
+                    return 0  # v1 < v2
+                else
+                    return 1  # v1 >= v2
+                fi
+            }
+            
+            if version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
+                # Package is below minimum version - not qualified for update
+                print_warning "Package $PACKAGE version $CURRENT_VERSION is below minimum version $MIN_VERSION. Not qualified for update."
+                continue
+            else
+                print_color "$GREEN$BOLD" "Package $PACKAGE version $CURRENT_VERSION is qualified (>= $MIN_VERSION) and will be updated to $TARGET_VERSION"
+            fi
         else
-            print_info "Using dev branch strategy - will commit directly to $WORKING_BRANCH..."
-            # For dev strategy, commit directly to the current branch (no new branch needed)
-            BRANCH_NAME="$WORKING_BRANCH"
+            print_color "$GREEN$BOLD" "Package $PACKAGE version $CURRENT_VERSION will be updated to $TARGET_VERSION"
         fi
         
         # Update the package version in requirements.txt
         print_info "Updating $PACKAGE to version $TARGET_VERSION..."
-        # Use more precise sed command with word boundaries to ensure exact package name matching
-        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[0-9][0-9.]*/${PACKAGE}==${TARGET_VERSION}/" requirements.txt
+        # Use more precise sed command to replace the entire version string
+        # This handles versions with wildcards, pre-release tags, etc.
+        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[^[:space:]]+[[:space:]]*$/\1==${TARGET_VERSION}/" requirements.txt
         rm -f requirements.txt.bak
         
+        # Validate the replacement was successful
+        NEW_LINE=$(grep -E "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
+        if ! echo "$NEW_LINE" | grep -q "^${PACKAGE}==${TARGET_VERSION}$"; then
+            print_error "Failed to properly update $PACKAGE in requirements.txt"
+            print_warning "Expected: ${PACKAGE}==${TARGET_VERSION}"
+            print_warning "Got: $NEW_LINE"
+            continue
+        fi
+        
+        REPO_HAS_CHANGES=true
+        UPDATED_PACKAGES+=("$PACKAGE:$CURRENT_VERSION->$TARGET_VERSION")
+    done
+    
+    # If changes were made, commit and push
+    if [ "$REPO_HAS_CHANGES" = true ]; then
+        print_color "$CYAN" "---"
+        print_color "$YELLOW" "Summary of changes in this repository:"
+        for UPDATE in "${UPDATED_PACKAGES[@]}"; do
+            PKG_NAME=$(echo "$UPDATE" | cut -d':' -f1)
+            VERSIONS=$(echo "$UPDATE" | cut -d':' -f2)
+            print_color "$YELLOW" "  • $PKG_NAME: $VERSIONS"
+        done
+        
         # Show diff for review
-        print_color "$YELLOW" "Changes to be made:"
+        print_color "$YELLOW" "\nFull diff:"
         git diff
         
         # Check for auto-approve or ask for confirmation
@@ -322,9 +433,42 @@ for REPO in $REPOS; do
         fi
         
         if [ "$APPROVE" = "y" ] || [ "$APPROVE" = "Y" ]; then
+            # Create commit message
+            if [ ${#UPDATED_PACKAGES[@]} -eq 1 ]; then
+                PKG_NAME=$(echo "${UPDATED_PACKAGES[0]}" | cut -d':' -f1)
+                TARGET_VER=$(echo "${UPDATED_PACKAGES[0]}" | cut -d':' -f2 | cut -d'-' -f2 | cut -d'>' -f2)
+                COMMIT_MSG="Update $PKG_NAME to $TARGET_VER"
+            else
+                COMMIT_MSG="Update multiple packages: "
+                for UPDATE in "${UPDATED_PACKAGES[@]}"; do
+                    PKG_NAME=$(echo "$UPDATE" | cut -d':' -f1)
+                    COMMIT_MSG="$COMMIT_MSG$PKG_NAME, "
+                done
+                # Remove trailing comma and space
+                COMMIT_MSG=$(echo "$COMMIT_MSG" | sed 's/, $//')
+            fi
+            
+            # Create a new branch for the update if using main strategy
+            if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
+                # Generate branch name
+                if [ ${#UPDATED_PACKAGES[@]} -eq 1 ]; then
+                    PKG_NAME=$(echo "${UPDATED_PACKAGES[0]}" | cut -d':' -f1)
+                    TARGET_VER=$(echo "${UPDATED_PACKAGES[0]}" | cut -d':' -f2 | cut -d'-' -f2 | cut -d'>' -f2)
+                    BRANCH_NAME="update-$PKG_NAME-to-$TARGET_VER"
+                else
+                    BRANCH_NAME="update-multiple-packages-$(date +%Y%m%d-%H%M%S)"
+                fi
+                
+                print_info "Using main branch strategy - will create PR for manual merge..."
+                git checkout -b "$BRANCH_NAME"
+            else
+                print_info "Using dev branch strategy - will commit directly to $WORKING_BRANCH..."
+                BRANCH_NAME="$WORKING_BRANCH"
+            fi
+            
             # Commit changes
             git add requirements.txt
-            git commit -m "Update $PACKAGE to $TARGET_VERSION to fix vulnerability"
+            git commit -m "$COMMIT_MSG"
             
             if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
                 # For main branch strategy: push feature branch and create PR (no auto-merge)
@@ -333,12 +477,15 @@ for REPO in $REPOS; do
                     
                     # Create a pull request
                     print_info "Creating pull request..."
-                    PR_TITLE="Update $PACKAGE to $TARGET_VERSION"
-                    if [ -n "$MIN_VERSION" ]; then
-                        PR_BODY="This PR updates $PACKAGE from $CURRENT_VERSION to $TARGET_VERSION (qualified package >= $MIN_VERSION) to fix a security vulnerability."
-                    else
-                        PR_BODY="This PR updates $PACKAGE from $CURRENT_VERSION to $TARGET_VERSION to fix a security vulnerability."
-                    fi
+                    PR_TITLE="$COMMIT_MSG"
+                    
+                    # Build PR body
+                    PR_BODY="This PR updates the following packages:\n\n"
+                    for UPDATE in "${UPDATED_PACKAGES[@]}"; do
+                        PKG_NAME=$(echo "$UPDATE" | cut -d':' -f1)
+                        VERSIONS=$(echo "$UPDATE" | cut -d':' -f2)
+                        PR_BODY="${PR_BODY}- $PKG_NAME: $VERSIONS\n"
+                    done
                     
                     if PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME"); then
                         print_pr_link "$PR_URL"
@@ -360,6 +507,8 @@ for REPO in $REPOS; do
         else
             print_warning "Changes not approved. Skipping."
         fi
+    else
+        print_info "No packages needed updating in this repository."
     fi
     
     print_success "Finished processing $ORG/$REPO."

@@ -6,7 +6,8 @@ A Bash script to automatically update package versions in `requirements.txt` fil
 
 - 🔍 **Organization-wide scanning**: Automatically discovers and processes all repositories in a GitHub organization
 - 📦 **Package-specific updates**: Target specific packages for version updates
-- 🔒 **Version filtering**: Option to only update packages that meet minimum version requirements
+- � **Multi-package support**: Update multiple packages from a file in a single run
+- �🔒 **Version filtering**: Option to only update packages that meet minimum version requirements (single-package mode)
 - 🌿 **Branch strategy support**: Two different workflow strategies (dev branch and main branch)
 - 🎨 **Colorized output**: Clear, colored terminal output for better readability
 - ✅ **Interactive confirmation**: Review changes before applying (with auto-approve option)
@@ -47,22 +48,47 @@ A Bash script to automatically update package versions in `requirements.txt` fil
 
 ### Basic Syntax
 
+**Single Package Mode:**
 ```bash
 ./patch_requirements.sh -o <organization> -p <package> -r <target_version> [OPTIONS]
+```
+
+**Multi-Package Mode:**
+```bash
+./patch_requirements.sh -o <organization> -f <packages_file> [OPTIONS]
 ```
 
 ### Required Arguments
 
 - `-o <organization>`: GitHub organization name
+
+### Single Package Mode Arguments
+
 - `-p <package>`: Package name to check and update
 - `-r <target_version>`: Target version to update packages to
+- `-v <minimum_version>`: (Optional) Minimum version required for qualification
+
+### Multi-Package Mode Arguments
+
+- `-f <packages_file>`: Path to file containing package,version pairs (one per line)
+
+**Packages File Format:**
+```
+# Comments start with # and are ignored
+# Format: package_name, version
+
+fastapi, 0.120.4
+starlette, 0.49.1
+requests, 2.31.0
+```
 
 ### Optional Arguments
 
-- `-v <minimum_version>`: Minimum version required for qualification (if not set, all packages qualify)
 - `-y`: Auto-approve all changes (skip user confirmation)
 - `--main`: Use main branch strategy (create PR for manual merge). Default is dev branch strategy
 - `-h`: Display help message
+
+**Note:** You must use either single package mode (`-p` and `-r`) OR multi-package mode (`-f`), not both.
 
 ## Branch Strategies
 
@@ -81,36 +107,75 @@ A Bash script to automatically update package versions in `requirements.txt` fil
 
 ## Examples
 
-### Update all packages to a specific version
+### Single Package Mode
+
+#### Update all packages to a specific version
 ```bash
 ./patch_requirements.sh -o myorg -p requests -r 2.28.0
 ```
 
-### Update only packages that meet minimum version requirement
+#### Update only packages that meet minimum version requirement
 ```bash
 ./patch_requirements.sh -o myorg -p requests -r 11.3.0 -v 11.2.0
 ```
 
-### Use main branch strategy with auto-approval
+#### Use main branch strategy with auto-approval
 ```bash
 ./patch_requirements.sh -o myorg -p django -r 4.2.1 -v 4.1.0 --main -y
 ```
 
-### Security patch example
+#### Security patch example
 ```bash
 ./patch_requirements.sh -o mycompany -p pillow -r 9.5.0 -v 9.0.0 -y
 ```
 
+### Multi-Package Mode
+
+#### Update multiple packages from a file
+```bash
+./patch_requirements.sh -o myorg -f packages.txt
+```
+
+#### Update multiple packages with auto-approval
+```bash
+./patch_requirements.sh -o myorg -f packages.txt -y
+```
+
+#### Update multiple packages using main branch strategy
+```bash
+./patch_requirements.sh -o myorg -f packages.txt --main -y
+```
+
+#### Example packages.txt file
+```
+# Security updates for multiple packages
+fastapi, 0.120.4
+starlette, 0.49.1
+pydantic, 2.10.3
+uvicorn, 0.34.0
+```
+
 ## How It Works
 
-1. **Repository Discovery**: Fetches all repositories from the specified GitHub organization
-2. **Branch Selection**: Determines which branch to work with based on the chosen strategy
-3. **Requirements Analysis**: Checks each repository for `requirements.txt` and the target package
-4. **Version Comparison**: Compares current package version with target and minimum versions
-5. **Update Process**: Updates the package version if criteria are met
-6. **Change Review**: Shows diff and asks for confirmation (unless auto-approved)
-7. **Commit & Push**: Commits changes and pushes to appropriate branch
-8. **PR Creation**: Creates pull request if using main branch strategy
+1. **Mode Selection**: Determines whether to run in single-package or multi-package mode
+2. **Package Loading**: Loads package(s) and target version(s) from arguments or file
+3. **Repository Discovery**: Fetches all repositories from the specified GitHub organization
+4. **Branch Selection**: Determines which branch to work with based on the chosen strategy
+5. **Requirements Analysis**: Checks each repository for `requirements.txt` and the target package(s)
+6. **Version Comparison**: Compares current package version with target (and minimum version in single-package mode)
+7. **Update Process**: Updates the package version(s) if criteria are met
+8. **Change Review**: Shows diff and asks for confirmation (unless auto-approved)
+9. **Commit & Push**: Commits changes and pushes to appropriate branch
+10. **PR Creation**: Creates pull request if using main branch strategy
+
+### Multi-Package Mode Behavior
+
+When using multi-package mode (`-f` flag):
+- All packages specified in the file are processed for each repository
+- Only packages found in the repository's `requirements.txt` are updated
+- If a package is already at the target version, it's skipped
+- A single commit is created with all applicable changes per repository
+- The commit message lists all updated packages
 
 ## Output
 
