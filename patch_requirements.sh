@@ -347,37 +347,43 @@ for REPO in $REPOS; do
         CURRENT_VERSION=$(echo "$CURRENT_VERSION" | tr -d '[:space:]')
         print_info "    Current version: $CURRENT_VERSION"
         
+        # Function to compare versions (handles simple version formats)
+        version_lt() {
+            # Remove any characters after the version number
+            local v1=$(echo "$1" | sed 's/[^0-9.].*$//')
+            local v2=$(echo "$2" | sed 's/[^0-9.].*$//')
+            
+            # Compare versions
+            if [ "$(printf '%s\n' "$v1" "$v2" | sort -V | head -n1)" = "$v1" ] && [ "$v1" != "$v2" ]; then
+                return 0  # v1 < v2
+            else
+                return 1  # v1 >= v2
+            fi
+        }
+        
         # Check if package is already at target version
         if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
             print_success "    Already at target version. Skipping."
             continue
         fi
         
+        # Prevent downgrade: check if current version is higher than target version
+        if ! version_lt "$CURRENT_VERSION" "$TARGET_VERSION"; then
+            print_warning "    Current version ($CURRENT_VERSION) is higher than or equal to target ($TARGET_VERSION). Skipping to prevent downgrade."
+            continue
+        fi
+        
         # Check if minimum version requirement applies (only in single package mode)
         if [ -n "$MIN_VERSION" ]; then
-            # Function to compare versions (handles simple version formats)
-            version_lt() {
-                # Remove any characters after the version number
-                local v1=$(echo "$1" | sed 's/[^0-9.].*$//')
-                local v2=$(echo "$2" | sed 's/[^0-9.].*$//')
-                
-                # Compare versions
-                if [ "$(printf '%s\n' "$v1" "$v2" | sort -V | head -n1)" = "$v1" ] && [ "$v1" != "$v2" ]; then
-                    return 0  # v1 < v2
-                else
-                    return 1  # v1 >= v2
-                fi
-            }
-            
             if version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
                 # Package is below minimum version - not qualified for update
                 print_warning "    Version $CURRENT_VERSION is below minimum $MIN_VERSION. Not qualified."
                 continue
             else
-                print_color "$GREEN" "    ✓ Qualified (>= $MIN_VERSION). Will update to $TARGET_VERSION"
+                print_color "$GREEN" "    ✓ Qualified (>= $MIN_VERSION). Will upgrade to $TARGET_VERSION"
             fi
         else
-            print_color "$GREEN" "    ✓ Will update from $CURRENT_VERSION to $TARGET_VERSION"
+            print_color "$GREEN" "    ✓ Will upgrade from $CURRENT_VERSION to $TARGET_VERSION"
         fi
         
         PACKAGES_NEED_UPDATE=true
