@@ -457,14 +457,16 @@ for REPO in $REPOS; do
         done
         
         # Show diff for review
-        print_color "$YELLOW" "\nFull diff:"
-        git diff
-        
-        # Check for auto-approve or ask for confirmation
         if [ "$AUTO_APPROVE" = true ]; then
+            # In auto-approve mode, show non-interactive diff
+            print_color "$YELLOW" "\nChanges to be applied:"
+            git --no-pager diff --color=always
             print_info "Auto-approve mode enabled. Proceeding with changes..."
             APPROVE="y"
         else
+            # In interactive mode, use regular diff (may use pager)
+            print_color "$YELLOW" "\nFull diff:"
+            git diff
             print_color "$YELLOW" "Approve these changes? (y/n): "
             read APPROVE
         fi
@@ -493,7 +495,7 @@ for REPO in $REPOS; do
                     TARGET_VER=$(echo "${UPDATED_PACKAGES[0]}" | cut -d':' -f2 | cut -d'-' -f2 | cut -d'>' -f2)
                     BRANCH_NAME="update-$PKG_NAME-to-$TARGET_VER"
                 else
-                    BRANCH_NAME="update-multiple-packages-$(date +%Y%m%d-%H%M%S)"
+                    BRANCH_NAME="update-multiple-packages"
                 fi
                 
                 print_info "Using main branch strategy - will create PR for manual merge..."
@@ -517,11 +519,11 @@ for REPO in $REPOS; do
                     PR_TITLE="$COMMIT_MSG"
                     
                     # Build PR body
-                    PR_BODY="This PR updates the following packages:\n\n"
+                    PR_BODY="This PR updates the following packages:"$'\n\n'
                     for UPDATE in "${UPDATED_PACKAGES[@]}"; do
                         PKG_NAME=$(echo "$UPDATE" | cut -d':' -f1)
                         VERSIONS=$(echo "$UPDATE" | cut -d':' -f2)
-                        PR_BODY="${PR_BODY}- $PKG_NAME: $VERSIONS\n"
+                        PR_BODY="${PR_BODY}- $PKG_NAME: $VERSIONS"$'\n'
                     done
                     
                     if PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME"); then
