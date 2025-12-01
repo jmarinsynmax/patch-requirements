@@ -334,15 +334,15 @@ for REPO in $REPOS; do
         
         print_color "$CYAN" "  → Checking package: $PACKAGE (target: $TARGET_VERSION)"
         
-        # Check if the package exists in requirements.txt - making sure to match exact package name
-        if ! echo "$REQUIREMENTS_CONTENT" | grep -q "^${PACKAGE}[[:space:]]*[=]"; then
+        # Check if the package exists in requirements.txt - case-insensitive matching
+        if ! echo "$REQUIREMENTS_CONTENT" | grep -iq "^${PACKAGE}[[:space:]]*[=]"; then
             print_warning "    Package $PACKAGE not found in requirements.txt. Skipping this package."
             continue
         fi
         
-        # Get current version of the package - use exact package matching
-        CURRENT_LINE=$(echo "$REQUIREMENTS_CONTENT" | grep -E "^${PACKAGE}[[:space:]]*[=]")
-        CURRENT_VERSION=$(echo "$CURRENT_LINE" | sed -E "s/^${PACKAGE}[[:space:]]*==?//")
+        # Get current version of the package - case-insensitive matching
+        CURRENT_LINE=$(echo "$REQUIREMENTS_CONTENT" | grep -iE "^${PACKAGE}[[:space:]]*[=]")
+        CURRENT_VERSION=$(echo "$CURRENT_LINE" | sed -E "s/^${PACKAGE}[[:space:]]*==?//i")
         # Trim any whitespace
         CURRENT_VERSION=$(echo "$CURRENT_VERSION" | tr -d '[:space:]')
         print_info "    Current version: $CURRENT_VERSION"
@@ -428,14 +428,14 @@ for REPO in $REPOS; do
         
         # Update the package version in requirements.txt
         print_info "Updating $PACKAGE to version $TARGET_VERSION..."
-        # Use more precise sed command to replace the entire version string
+        # Use case-insensitive sed command to handle different capitalizations
         # This handles versions with wildcards, pre-release tags, etc.
-        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[^[:space:]]+[[:space:]]*$/\1==${TARGET_VERSION}/" requirements.txt
+        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[^[:space:]]+[[:space:]]*$/\1==${TARGET_VERSION}/i" requirements.txt
         rm -f requirements.txt.bak
         
-        # Validate the replacement was successful
-        NEW_LINE=$(grep -E "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
-        if ! echo "$NEW_LINE" | grep -q "^${PACKAGE}==${TARGET_VERSION}$"; then
+        # Validate the replacement was successful - case-insensitive check
+        NEW_LINE=$(grep -iE "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
+        if ! echo "$NEW_LINE" | grep -iq "^${PACKAGE}==${TARGET_VERSION}$"; then
             print_error "Failed to properly update $PACKAGE in requirements.txt"
             print_warning "Expected: ${PACKAGE}==${TARGET_VERSION}"
             print_warning "Got: $NEW_LINE"
