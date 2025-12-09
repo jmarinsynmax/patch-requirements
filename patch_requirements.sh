@@ -70,10 +70,12 @@ usage() {
     echo
     print_color "$YELLOW" "Multi-Package Mode:"
     print_color "$WHITE" "  -f: Path to file containing package,version pairs (one per line)"
-    print_color "$WHITE" "      Format: package_name, version"
+    print_color "$WHITE" "      Format: package_name, target_version[, minimum_version]"
     print_color "$WHITE" "      Example file contents:"
-    print_color "$WHITE" "        fastapi, 0.120.4"
+    print_color "$WHITE" "        fastapi, 0.120.4, 0.115.0"
     print_color "$WHITE" "        starlette, 0.49.1"
+    print_color "$WHITE" "      Note: minimum_version is optional. If specified, only packages"
+    print_color "$WHITE" "            with version >= minimum_version will be updated."
     echo
     print_color "$YELLOW" "Optional Arguments:"
     print_color "$WHITE" "  -y: Auto-approve all changes (skip user confirmation)"
@@ -227,10 +229,11 @@ parse_packages_file() {
             continue
         fi
         
-        # Parse package and version (expecting format: package, version or package,version)
-        if [[ "$line" =~ ^([^,]+),(.+)$ ]]; then
+        # Parse package and version (expecting format: package, target_version or package, target_version, minimum_version)
+        if [[ "$line" =~ ^([^,]+),([^,]+)(,(.+))?$ ]]; then
             local pkg=$(echo "${BASH_REMATCH[1]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             local ver=$(echo "${BASH_REMATCH[2]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            local min_ver=$(echo "${BASH_REMATCH[4]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             
             if [ -z "$pkg" ] || [ -z "$ver" ]; then
                 print_warning "Skipping invalid line: $line"
@@ -243,8 +246,13 @@ parse_packages_file() {
                 continue
             fi
             
-            packages_array+=("$pkg:$ver")
-            print_success "Loaded: $pkg -> $ver"
+            # Format: package:target_version:minimum_version (minimum_version can be empty)
+            packages_array+=("$pkg:$ver:$min_ver")
+            if [ -n "$min_ver" ]; then
+                print_success "Loaded: $pkg -> $ver (min: $min_ver)"
+            else
+                print_success "Loaded: $pkg -> $ver"
+            fi
         else
             print_warning "Skipping invalid line format: $line"
         fi
@@ -271,7 +279,8 @@ if [ -n "$PACKAGES_FILE" ]; then
     done < <(parse_packages_file "$PACKAGES_FILE")
 else
     # Single package mode: create array with single entry
-    PACKAGES_TO_UPDATE=("$PACKAGE:$TARGET_VERSION_ARG")
+    # Format: package:target_version:minimum_version
+    PACKAGES_TO_UPDATE=("$PACKAGE:$TARGET_VERSION_ARG:$MIN_VERSION")
 fi
 
 # Get list of repositories in the organization
@@ -313,6 +322,60 @@ for REPO in $REPOS; do
     fi
     print_success "requirements.txt found in $WORKING_BRANCH branch."
     
+    # If using main strategy, verify that dev branch has the target versions already
+    if [ "$USE_MAIN_STRATEGY" = true ]; then
+        print_info "Main branch strategy enabled - checking dev branch first..."
+        
+        # Check if dev branch exists
+        if ! gh api "repos/$ORG/$REPO/branches/dev" &> /dev/null; then
+            print_warning "dev branch not found in $ORG/$REPO. Skipping repository (main strategy requires dev branch)."
+            continue
+        fi
+        
+        # Check if requirements.txt exists in dev branch
+        if ! gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=dev" &> /dev/null; then
+            print_warning "requirements.txt not found in dev branch of $ORG/$REPO. Skipping repository."
+            continue
+        fi
+        
+        # Fetch dev branch requirements.txt
+        DEV_REQUIREMENTS_CONTENT=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=dev" --jq '.content' | base64 -d 2>/dev/null)
+        
+        if [ -z "$DEV_REQUIREMENTS_CONTENT" ]; then
+            print_error "Failed to fetch dev branch requirements.txt content. Skipping repository."
+            continue
+        fi
+        
+        print_success "Dev branch requirements.txt fetched successfully."
+        
+        # Verify all target packages are already at target version in dev
+        DEV_HAS_ALL_VERSIONS=true
+        for PACKAGE_ENTRY in "${PACKAGES_TO_UPDATE[@]}"; do
+            IFS=':' read -r PACKAGE TARGET_VERSION MIN_VER <<< "$PACKAGE_ENTRY"
+            
+            # Check if package exists in dev requirements.txt
+            if echo "$DEV_REQUIREMENTS_CONTENT" | grep -iq "^${PACKAGE}[[:space:]]*[=]"; then
+                DEV_VERSION=$(echo "$DEV_REQUIREMENTS_CONTENT" | grep -iE "^${PACKAGE}[[:space:]]*[=]" | sed -E "s/^${PACKAGE}[[:space:]]*==?//i" | tr -d '[:space:]')
+                
+                if [ "$DEV_VERSION" != "$TARGET_VERSION" ]; then
+                    print_warning "Package $PACKAGE in dev branch is at version $DEV_VERSION, not target $TARGET_VERSION."
+                    DEV_HAS_ALL_VERSIONS=false
+                fi
+            else
+                print_warning "Package $PACKAGE not found in dev branch."
+                DEV_HAS_ALL_VERSIONS=false
+            fi
+        done
+        
+        if [ "$DEV_HAS_ALL_VERSIONS" = false ]; then
+            print_error "Dev branch does not have all target package versions. Skipping repository for safety."
+            print_info "Packages must be tested in dev before updating main."
+            continue
+        fi
+        
+        print_success "All target package versions verified in dev branch. Proceeding with main branch update."
+    fi
+    
     # Fetch and analyze requirements.txt content via API to check if updates are needed
     print_info "Scanning requirements.txt for packages that need updating..."
     REQUIREMENTS_CONTENT=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$WORKING_BRANCH" --jq '.content' | base64 -d 2>/dev/null)
@@ -328,9 +391,8 @@ for REPO in $REPOS; do
     
     # Check each package to see if it needs updating
     for PACKAGE_ENTRY in "${PACKAGES_TO_UPDATE[@]}"; do
-        # Parse package name and target version
-        PACKAGE=$(echo "$PACKAGE_ENTRY" | cut -d':' -f1)
-        TARGET_VERSION=$(echo "$PACKAGE_ENTRY" | cut -d':' -f2)
+        # Parse package name, target version, and optional minimum version
+        IFS=':' read -r PACKAGE TARGET_VERSION PACKAGE_MIN_VERSION <<< "$PACKAGE_ENTRY"
         
         print_color "$CYAN" "  → Checking package: $PACKAGE (target: $TARGET_VERSION)"
         
@@ -373,14 +435,14 @@ for REPO in $REPOS; do
             continue
         fi
         
-        # Check if minimum version requirement applies (only in single package mode)
-        if [ -n "$MIN_VERSION" ]; then
-            if version_lt "$CURRENT_VERSION" "$MIN_VERSION"; then
+        # Check if minimum version requirement applies
+        if [ -n "$PACKAGE_MIN_VERSION" ]; then
+            if version_lt "$CURRENT_VERSION" "$PACKAGE_MIN_VERSION"; then
                 # Package is below minimum version - not qualified for update
-                print_warning "    Version $CURRENT_VERSION is below minimum $MIN_VERSION. Not qualified."
+                print_warning "    Version $CURRENT_VERSION is below minimum $PACKAGE_MIN_VERSION. Not qualified."
                 continue
             else
-                print_color "$GREEN" "    ✓ Qualified (>= $MIN_VERSION). Will upgrade to $TARGET_VERSION"
+                print_color "$GREEN" "    ✓ Qualified (>= $PACKAGE_MIN_VERSION). Will upgrade to $TARGET_VERSION"
             fi
         else
             print_color "$GREEN" "    ✓ Will upgrade from $CURRENT_VERSION to $TARGET_VERSION"
