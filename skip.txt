@@ -1,0 +1,10 @@
+# Repository Skip List
+# Add one repository name per line to skip during updates
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+
+# Example:
+# my-repo-name
+# another-repo-to-skip
+
+enr-object-ship-length

@@ -220,7 +220,7 @@ parse_packages_file() {
     local file=$1
     declare -a packages_array
     
-    print_info "Parsing packages file: $file"
+    print_info "Parsing packages file: $file" >&2
     
     while IFS= read -r line || [ -n "$line" ]; do
         # Skip empty lines and comments
@@ -236,34 +236,34 @@ parse_packages_file() {
             local min_ver=$(echo "${BASH_REMATCH[4]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             
             if [ -z "$pkg" ] || [ -z "$ver" ]; then
-                print_warning "Skipping invalid line: $line"
+                print_warning "Skipping invalid line: $line" >&2
                 continue
             fi
             
             # Validate package name length
             if [ ${#pkg} -lt 2 ]; then
-                print_warning "Skipping package '$pkg' - name too short"
+                print_warning "Skipping package '$pkg' - name too short" >&2
                 continue
             fi
             
             # Format: package:target_version:minimum_version (minimum_version can be empty)
             packages_array+=("$pkg:$ver:$min_ver")
             if [ -n "$min_ver" ]; then
-                print_success "Loaded: $pkg -> $ver (min: $min_ver)"
+                print_success "Loaded: $pkg -> $ver (min: $min_ver)" >&2
             else
-                print_success "Loaded: $pkg -> $ver"
+                print_success "Loaded: $pkg -> $ver" >&2
             fi
         else
-            print_warning "Skipping invalid line format: $line"
+            print_warning "Skipping invalid line format: $line" >&2
         fi
     done < "$file"
     
     if [ ${#packages_array[@]} -eq 0 ]; then
-        print_error "No valid package entries found in $file"
+        print_error "No valid package entries found in $file" >&2
         exit 1
     fi
     
-    print_success "Loaded ${#packages_array[@]} package(s) from file"
+    print_success "Loaded ${#packages_array[@]} package(s) from file" >&2
     
     # Return the array (by printing it)
     printf '%s\n' "${packages_array[@]}"
@@ -283,6 +283,27 @@ else
     PACKAGES_TO_UPDATE=("$PACKAGE:$TARGET_VERSION_ARG:$MIN_VERSION")
 fi
 
+# Load skip list if skip.txt exists
+SKIP_REPOS=()
+if [ -f "skip.txt" ]; then
+    print_info "Loading repository skip list from skip.txt..."
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip empty lines and comments
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -z "$line" ] || [[ "$line" =~ ^# ]]; then
+            continue
+        fi
+        SKIP_REPOS+=("$line")
+        print_color "$YELLOW" "  → Will skip: $line"
+    done < "skip.txt"
+    
+    if [ ${#SKIP_REPOS[@]} -gt 0 ]; then
+        print_success "Loaded ${#SKIP_REPOS[@]} repository/repositories to skip"
+    fi
+else
+    print_info "No skip.txt file found. All repositories will be processed."
+fi
+
 # Get list of repositories in the organization
 print_info "Fetching repositories from organization: $ORG"
 REPOS=$(gh repo list "$ORG" --limit 1000 --json name -q '.[].name')
@@ -297,6 +318,20 @@ print_success "Found $(echo "$REPOS" | wc -l | tr -d ' ') repositories."
 # Process each repository
 for REPO in $REPOS; do
     print_header "Processing repository: $ORG/$REPO"
+    
+    # Check if repository is in skip list
+    SHOULD_SKIP=false
+    for SKIP_REPO in "${SKIP_REPOS[@]}"; do
+        if [ "$REPO" = "$SKIP_REPO" ]; then
+            SHOULD_SKIP=true
+            break
+        fi
+    done
+    
+    if [ "$SHOULD_SKIP" = true ]; then
+        print_warning "Repository $REPO is in skip list. Skipping."
+        continue
+    fi
     
     # Determine which branch to check based on strategy
     WORKING_BRANCH=""
@@ -572,7 +607,7 @@ for REPO in $REPOS; do
             git commit -m "$COMMIT_MSG"
             
             if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
-                # For main branch strategy: push feature branch and create PR (no auto-merge)
+                # For main branch strategy: push feature branch and create PR
                 if git push -u origin "$BRANCH_NAME"; then
                     print_success "Changes pushed to branch $BRANCH_NAME in $ORG/$REPO."
                     
@@ -590,7 +625,27 @@ for REPO in $REPOS; do
                     
                     if PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME"); then
                         print_pr_link "$PR_URL"
-                        print_color "$PURPLE" "Note: The PR has been created for manual review and merge."
+                        
+                        # Ask user if they want to merge the PR (or auto-merge if -y flag is set)
+                        MERGE_PR="n"
+                        if [ "$AUTO_APPROVE" = true ]; then
+                            print_info "Auto-approve mode enabled. Merging PR automatically..."
+                            MERGE_PR="y"
+                        else
+                            print_color "$YELLOW" "Do you want to merge this PR now? (y/n): "
+                            read MERGE_PR
+                        fi
+                        
+                        if [ "$MERGE_PR" = "y" ] || [ "$MERGE_PR" = "Y" ]; then
+                            print_info "Merging pull request..."
+                            if gh pr merge "$PR_URL" --merge --delete-branch --admin; then
+                                print_success "PR merged successfully and branch deleted."
+                            else
+                                print_error "Failed to merge pull request. You may need to merge it manually."
+                            fi
+                        else
+                            print_color "$PURPLE" "Note: The PR has been created for manual review and merge."
+                        fi
                     else
                         print_error "Failed to create pull request."
                     fi
