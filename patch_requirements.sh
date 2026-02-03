@@ -439,7 +439,8 @@ for REPO in $REPOS; do
         
         # Get current version of the package - case-insensitive matching
         CURRENT_LINE=$(echo "$REQUIREMENTS_CONTENT" | grep -iE "^${PACKAGE}[[:space:]]*[=]")
-        CURRENT_VERSION=$(echo "$CURRENT_LINE" | sed -E "s/^${PACKAGE}[[:space:]]*==?//i")
+        # Extract version, stripping any inline comments first
+        CURRENT_VERSION=$(echo "$CURRENT_LINE" | sed -E "s/#.*$//" | sed -E "s/^${PACKAGE}[[:space:]]*==?//i")
         # Trim any whitespace
         CURRENT_VERSION=$(echo "$CURRENT_VERSION" | tr -d '[:space:]')
         print_info "    Current version: $CURRENT_VERSION"
@@ -526,15 +527,15 @@ for REPO in $REPOS; do
         # Update the package version in requirements.txt
         print_info "Updating $PACKAGE to version $TARGET_VERSION..."
         # Use case-insensitive sed command to handle different capitalizations
-        # This handles versions with wildcards, pre-release tags, etc.
-        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[^[:space:]]+[[:space:]]*$/\1==${TARGET_VERSION}/i" requirements.txt
+        # This handles versions with wildcards, pre-release tags, and preserves inline comments
+        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[^[:space:]#]+([[:space:]]*(#.*)?)?$/\1==${TARGET_VERSION}\2/i" requirements.txt
         rm -f requirements.txt.bak
         
-        # Validate the replacement was successful - case-insensitive check
+        # Validate the replacement was successful - case-insensitive check (allow inline comments)
         NEW_LINE=$(grep -iE "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
-        if ! echo "$NEW_LINE" | grep -iq "^${PACKAGE}==${TARGET_VERSION}$"; then
+        if ! echo "$NEW_LINE" | grep -iqE "^${PACKAGE}==${TARGET_VERSION}([[:space:]]*(#.*)?)?$"; then
             print_error "Failed to properly update $PACKAGE in requirements.txt"
-            print_warning "Expected: ${PACKAGE}==${TARGET_VERSION}"
+            print_warning "Expected: ${PACKAGE}==${TARGET_VERSION} (with optional comment)"
             print_warning "Got: $NEW_LINE"
             continue
         fi
