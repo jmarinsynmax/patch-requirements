@@ -357,7 +357,7 @@ for REPO in $REPOS; do
     fi
     print_success "requirements.txt found in $WORKING_BRANCH branch."
     
-    # If using main strategy, verify that dev branch has the target versions already
+    # If using main strategy, fetch dev branch requirements.txt for per-package verification later
     if [ "$USE_MAIN_STRATEGY" = true ]; then
         print_info "Main branch strategy enabled - checking dev branch first..."
         
@@ -382,33 +382,6 @@ for REPO in $REPOS; do
         fi
         
         print_success "Dev branch requirements.txt fetched successfully."
-        
-        # Verify all target packages are already at target version in dev
-        DEV_HAS_ALL_VERSIONS=true
-        for PACKAGE_ENTRY in "${PACKAGES_TO_UPDATE[@]}"; do
-            IFS=':' read -r PACKAGE TARGET_VERSION MIN_VER <<< "$PACKAGE_ENTRY"
-            
-            # Check if package exists in dev requirements.txt
-            if echo "$DEV_REQUIREMENTS_CONTENT" | grep -iq "^${PACKAGE}[[:space:]]*[=]"; then
-                DEV_VERSION=$(echo "$DEV_REQUIREMENTS_CONTENT" | grep -iE "^${PACKAGE}[[:space:]]*[=]" | sed -E "s/^${PACKAGE}[[:space:]]*==?//i" | tr -d '[:space:]')
-                
-                if [ "$DEV_VERSION" != "$TARGET_VERSION" ]; then
-                    print_warning "Package $PACKAGE in dev branch is at version $DEV_VERSION, not target $TARGET_VERSION."
-                    DEV_HAS_ALL_VERSIONS=false
-                fi
-            else
-                print_warning "Package $PACKAGE not found in dev branch."
-                DEV_HAS_ALL_VERSIONS=false
-            fi
-        done
-        
-        if [ "$DEV_HAS_ALL_VERSIONS" = false ]; then
-            print_error "Dev branch does not have all target package versions. Skipping repository for safety."
-            print_info "Packages must be tested in dev before updating main."
-            continue
-        fi
-        
-        print_success "All target package versions verified in dev branch. Proceeding with main branch update."
     fi
     
     # Fetch and analyze requirements.txt content via API to check if updates are needed
@@ -435,6 +408,22 @@ for REPO in $REPOS; do
         if ! echo "$REQUIREMENTS_CONTENT" | grep -iq "^${PACKAGE}[[:space:]]*[=]"; then
             print_warning "    Package $PACKAGE not found in requirements.txt. Skipping this package."
             continue
+        fi
+        
+        # If using main strategy, verify this specific package is at target version in dev
+        if [ "$USE_MAIN_STRATEGY" = true ]; then
+            if echo "$DEV_REQUIREMENTS_CONTENT" | grep -iq "^${PACKAGE}[[:space:]]*[=]"; then
+                DEV_VERSION=$(echo "$DEV_REQUIREMENTS_CONTENT" | grep -iE "^${PACKAGE}[[:space:]]*[=]" | sed -E "s/^${PACKAGE}[[:space:]]*==?//i" | tr -d '[:space:]')
+                
+                if [ "$DEV_VERSION" != "$TARGET_VERSION" ]; then
+                    print_warning "    Package $PACKAGE in dev branch is at version $DEV_VERSION, not target $TARGET_VERSION. Skipping this package."
+                    continue
+                fi
+                print_success "    Verified $PACKAGE at target version in dev branch."
+            else
+                print_warning "    Package $PACKAGE not found in dev branch. Skipping this package."
+                continue
+            fi
         fi
         
         # Get current version of the package - case-insensitive matching
