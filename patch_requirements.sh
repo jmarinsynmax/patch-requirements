@@ -309,6 +309,64 @@ fi
 
 print_success "Found $(echo "$REPOS" | wc -l | tr -d ' ') repositories."
 
+# Determine which branch to check based on strategy
+WORKING_BRANCH=""
+if [ "$USE_MAIN_STRATEGY" = true ]; then
+    WORKING_BRANCH="main"
+else
+    WORKING_BRANCH="dev"
+fi
+
+# ── Parallel pre-fetch phase ──────────────────────────────────────────────
+# Fetch requirements.txt for all non-skipped repos in parallel using xargs
+# for true sliding-window concurrency (no batch-wait problem).
+PREFETCH_DIR=$(mktemp -d)
+MAX_PARALLEL=30
+
+prefetch_cleanup() {
+    rm -rf "$PREFETCH_DIR"
+}
+trap prefetch_cleanup EXIT
+
+# Build list of repos to fetch (exclude skip list)
+REPOS_TO_FETCH=()
+for REPO in $REPOS; do
+    SHOULD_SKIP=false
+    for SKIP_REPO in "${SKIP_REPOS[@]}"; do
+        if [ "$REPO" = "$SKIP_REPO" ]; then
+            SHOULD_SKIP=true
+            break
+        fi
+    done
+    if [ "$SHOULD_SKIP" = false ]; then
+        REPOS_TO_FETCH+=("$REPO")
+    fi
+done
+
+print_info "Pre-fetching requirements.txt from $WORKING_BRANCH branch for ${#REPOS_TO_FETCH[@]} repositories (parallel=$MAX_PARALLEL)..."
+
+# Helper script for xargs: fetches requirements.txt for one repo
+_FETCH_SCRIPT=$(cat << 'FETCHEOF'
+REPO="$1"; ORG="$2"; BRANCH="$3"; OUTDIR="$4"; MAIN_STRATEGY="$5"
+FILE_JSON=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$BRANCH" 2>/dev/null) || true
+if [ -n "$FILE_JSON" ]; then
+    printf '%s' "$FILE_JSON" > "$OUTDIR/${REPO}.json"
+fi
+if [ "$MAIN_STRATEGY" = "true" ]; then
+    DEV_JSON=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=dev" 2>/dev/null) || true
+    if [ -n "$DEV_JSON" ]; then
+        printf '%s' "$DEV_JSON" > "$OUTDIR/${REPO}.dev.json"
+    fi
+fi
+FETCHEOF
+)
+
+# Run pre-fetch with xargs -P for true sliding-window parallelism
+printf '%s\n' "${REPOS_TO_FETCH[@]}" | xargs -P "$MAX_PARALLEL" -I{} bash -c "$_FETCH_SCRIPT" _ {} "$ORG" "$WORKING_BRANCH" "$PREFETCH_DIR" "$USE_MAIN_STRATEGY"
+
+FETCHED_COUNT=$(ls -1 "$PREFETCH_DIR"/*.json 2>/dev/null | grep -cv '\.dev\.json$' 2>/dev/null || echo "0")
+print_success "Pre-fetch complete. ${FETCHED_COUNT} repositories have requirements.txt on $WORKING_BRANCH."
+
 # Process each repository
 for REPO in $REPOS; do
     print_header "Processing repository: $ORG/$REPO"
@@ -327,23 +385,13 @@ for REPO in $REPOS; do
         continue
     fi
     
-    # Determine which branch to check based on strategy
-    WORKING_BRANCH=""
-    if [ "$USE_MAIN_STRATEGY" = true ]; then
-        WORKING_BRANCH="main"
-    else
-        WORKING_BRANCH="dev"
-    fi
-    
-    # Fetch requirements.txt content + SHA in a single API call (also validates branch + file exist)
-    print_info "Fetching requirements.txt from $WORKING_BRANCH branch..."
-    FILE_JSON=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$WORKING_BRANCH" 2>/dev/null) || true
-    
-    if [ -z "$FILE_JSON" ]; then
+    # Use pre-fetched data instead of making API calls
+    if [ ! -f "$PREFETCH_DIR/${REPO}.json" ]; then
         print_warning "$WORKING_BRANCH branch or requirements.txt not found in $ORG/$REPO. Skipping repository."
         continue
     fi
     
+    FILE_JSON=$(cat "$PREFETCH_DIR/${REPO}.json")
     REQUIREMENTS_CONTENT=$(echo "$FILE_JSON" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null)
     FILE_SHA=$(echo "$FILE_JSON" | jq -r '.sha // empty' 2>/dev/null)
     
@@ -352,19 +400,16 @@ for REPO in $REPOS; do
         continue
     fi
     
-    print_success "requirements.txt fetched from $WORKING_BRANCH branch."
+    print_success "requirements.txt loaded from $WORKING_BRANCH branch."
     
-    # If using main strategy, fetch dev branch requirements.txt for per-package verification (single call)
+    # If using main strategy, load pre-fetched dev branch requirements.txt
     if [ "$USE_MAIN_STRATEGY" = true ]; then
-        print_info "Main branch strategy - fetching dev branch requirements.txt..."
-        
-        DEV_FILE_JSON=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=dev" 2>/dev/null) || true
-        
-        if [ -z "$DEV_FILE_JSON" ]; then
+        if [ ! -f "$PREFETCH_DIR/${REPO}.dev.json" ]; then
             print_warning "dev branch or requirements.txt not found in $ORG/$REPO. Skipping repository."
             continue
         fi
         
+        DEV_FILE_JSON=$(cat "$PREFETCH_DIR/${REPO}.dev.json")
         DEV_REQUIREMENTS_CONTENT=$(echo "$DEV_FILE_JSON" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null)
         
         if [ -z "$DEV_REQUIREMENTS_CONTENT" ]; then
@@ -372,7 +417,7 @@ for REPO in $REPOS; do
             continue
         fi
         
-        print_success "Dev branch requirements.txt fetched successfully."
+        print_success "Dev branch requirements.txt loaded successfully."
     fi
     
     # Scan requirements.txt for packages that need updating

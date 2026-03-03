@@ -5,3 +5,11 @@
 
 urllib3, 1.22, 2.6.3
 wheel, 0.40.0, 0.46.1
+protobuf, 6.30.0rc1, 6.33.4
+pillow, 10.3.0, 12.1.1
+keras, 3.0.0, 3.12.1
+python-multipart, 0.0.22
+jaraco.context, 5.2.0, 6.1.0
+pyasn1, 0.6.1
+cryptography, 46.0.4
+geopandas, 1.1.2
