@@ -196,24 +196,18 @@ if ! command -v gh &> /dev/null; then
     exit 1
 fi
 
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    print_error "jq is not installed. Please install it first."
+    print_info "On macOS: brew install jq"
+    exit 1
+fi
+
 # Check if gh is authenticated
 if ! gh auth status &> /dev/null; then
     print_error "GitHub CLI is not authenticated. Please run 'gh auth login' first."
     exit 1
 fi
-
-# Create a temporary directory for repository operations
-TEMP_DIR=$(mktemp -d)
-print_info "Created temporary directory: $TEMP_DIR"
-
-# Cleanup function to remove temporary directory on exit
-cleanup() {
-    print_info "Cleaning up temporary directory: $TEMP_DIR"
-    rm -rf "$TEMP_DIR"
-}
-
-# Register cleanup function to run on exit
-trap cleanup EXIT
 
 # Function to parse packages file and return array of package,version pairs
 parse_packages_file() {
@@ -341,40 +335,37 @@ for REPO in $REPOS; do
         WORKING_BRANCH="dev"
     fi
     
-    # Check if the working branch exists before cloning
-    print_info "Checking if $WORKING_BRANCH branch exists..."
-    if ! gh api "repos/$ORG/$REPO/branches/$WORKING_BRANCH" &> /dev/null; then
-        print_warning "$WORKING_BRANCH branch not found in $ORG/$REPO. Skipping repository."
+    # Fetch requirements.txt content + SHA in a single API call (also validates branch + file exist)
+    print_info "Fetching requirements.txt from $WORKING_BRANCH branch..."
+    FILE_JSON=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$WORKING_BRANCH" 2>/dev/null) || true
+    
+    if [ -z "$FILE_JSON" ]; then
+        print_warning "$WORKING_BRANCH branch or requirements.txt not found in $ORG/$REPO. Skipping repository."
         continue
     fi
-    print_success "$WORKING_BRANCH branch exists."
     
-    # Check if requirements.txt exists in the working branch before cloning
-    print_info "Checking if requirements.txt exists in $WORKING_BRANCH branch..."
-    if ! gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$WORKING_BRANCH" &> /dev/null; then
-        print_warning "requirements.txt not found in $WORKING_BRANCH branch of $ORG/$REPO. Skipping repository."
+    REQUIREMENTS_CONTENT=$(echo "$FILE_JSON" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null)
+    FILE_SHA=$(echo "$FILE_JSON" | jq -r '.sha // empty' 2>/dev/null)
+    
+    if [ -z "$REQUIREMENTS_CONTENT" ] || [ -z "$FILE_SHA" ]; then
+        print_error "Failed to parse requirements.txt content or SHA. Skipping repository."
         continue
     fi
-    print_success "requirements.txt found in $WORKING_BRANCH branch."
     
-    # If using main strategy, fetch dev branch requirements.txt for per-package verification later
+    print_success "requirements.txt fetched from $WORKING_BRANCH branch."
+    
+    # If using main strategy, fetch dev branch requirements.txt for per-package verification (single call)
     if [ "$USE_MAIN_STRATEGY" = true ]; then
-        print_info "Main branch strategy enabled - checking dev branch first..."
+        print_info "Main branch strategy - fetching dev branch requirements.txt..."
         
-        # Check if dev branch exists
-        if ! gh api "repos/$ORG/$REPO/branches/dev" &> /dev/null; then
-            print_warning "dev branch not found in $ORG/$REPO. Skipping repository (main strategy requires dev branch)."
+        DEV_FILE_JSON=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=dev" 2>/dev/null) || true
+        
+        if [ -z "$DEV_FILE_JSON" ]; then
+            print_warning "dev branch or requirements.txt not found in $ORG/$REPO. Skipping repository."
             continue
         fi
         
-        # Check if requirements.txt exists in dev branch
-        if ! gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=dev" &> /dev/null; then
-            print_warning "requirements.txt not found in dev branch of $ORG/$REPO. Skipping repository."
-            continue
-        fi
-        
-        # Fetch dev branch requirements.txt
-        DEV_REQUIREMENTS_CONTENT=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=dev" --jq '.content' | base64 -d 2>/dev/null)
+        DEV_REQUIREMENTS_CONTENT=$(echo "$DEV_FILE_JSON" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null)
         
         if [ -z "$DEV_REQUIREMENTS_CONTENT" ]; then
             print_error "Failed to fetch dev branch requirements.txt content. Skipping repository."
@@ -384,14 +375,8 @@ for REPO in $REPOS; do
         print_success "Dev branch requirements.txt fetched successfully."
     fi
     
-    # Fetch and analyze requirements.txt content via API to check if updates are needed
+    # Scan requirements.txt for packages that need updating
     print_info "Scanning requirements.txt for packages that need updating..."
-    REQUIREMENTS_CONTENT=$(gh api "repos/$ORG/$REPO/contents/requirements.txt?ref=$WORKING_BRANCH" --jq '.content' | base64 -d 2>/dev/null)
-    
-    if [ -z "$REQUIREMENTS_CONTENT" ]; then
-        print_error "Failed to fetch requirements.txt content. Skipping repository."
-        continue
-    fi
     
     # Track which packages need updating
     PACKAGES_NEED_UPDATE=false
@@ -477,27 +462,17 @@ for REPO in $REPOS; do
         PACKAGES_TO_UPDATE_IN_REPO+=("$PACKAGE:$CURRENT_VERSION:$TARGET_VERSION")
     done
     
-    # Skip cloning if no packages need updating
+    # Skip if no packages need updating
     if [ "$PACKAGES_NEED_UPDATE" = false ]; then
-        print_info "No packages need updating in this repository. Skipping clone."
+        print_info "No packages need updating in this repository. Skipping."
         continue
     fi
     
-    print_success "Found ${#PACKAGES_TO_UPDATE_IN_REPO[@]} package(s) that need updating. Proceeding with clone..."
+    print_success "Found ${#PACKAGES_TO_UPDATE_IN_REPO[@]} package(s) that need updating."
     
-    # Clone the repository to the temporary directory
-    print_info "Cloning repository..."
-    cd "$TEMP_DIR"
-    if ! gh repo clone "$ORG/$REPO" "$REPO" 2>/dev/null; then
-        print_error "Failed to clone repository $ORG/$REPO. Skipping."
-        continue
-    fi
-    
-    cd "$REPO"
-    
-    # Checkout the working branch
-    print_info "Using branch: $WORKING_BRANCH"
-    git checkout "$WORKING_BRANCH" > /dev/null 2>&1
+    # Write current content to a temp file for sed operations (no repo clone needed)
+    TEMP_REQ=$(mktemp)
+    printf '%s\n' "$REQUIREMENTS_CONTENT" > "$TEMP_REQ"
     
     # Track if any changes were made in this repository
     REPO_HAS_CHANGES=false
@@ -513,15 +488,15 @@ for REPO in $REPOS; do
         print_color "$CYAN" "---"
         print_color "$CYAN" "Updating package: $PACKAGE ($CURRENT_VERSION → $TARGET_VERSION)"
         
-        # Update the package version in requirements.txt
+        # Update the package version in the temp file
         print_info "Updating $PACKAGE to version $TARGET_VERSION..."
         # Use case-insensitive sed command to handle different capitalizations
         # This handles versions with wildcards, pre-release tags, and preserves inline comments
-        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[^[:space:]#]+([[:space:]]*(#.*)?)?$/\1==${TARGET_VERSION}\2/i" requirements.txt
-        rm -f requirements.txt.bak
+        sed -i.bak -E "s/^(${PACKAGE})[[:space:]]*==?[[:space:]]*[^[:space:]#]+([[:space:]]*(#.*)?)?$/\1==${TARGET_VERSION}\2/i" "$TEMP_REQ"
+        rm -f "${TEMP_REQ}.bak"
         
         # Validate the replacement was successful - case-insensitive check (allow inline comments)
-        NEW_LINE=$(grep -iE "^${PACKAGE}[[:space:]]*[=]" requirements.txt)
+        NEW_LINE=$(grep -iE "^${PACKAGE}[[:space:]]*[=]" "$TEMP_REQ")
         if ! echo "$NEW_LINE" | grep -iqE "^${PACKAGE}==${TARGET_VERSION}([[:space:]]*(#.*)?)?$"; then
             print_error "Failed to properly update $PACKAGE in requirements.txt"
             print_warning "Expected: ${PACKAGE}==${TARGET_VERSION} (with optional comment)"
@@ -533,7 +508,11 @@ for REPO in $REPOS; do
         UPDATED_PACKAGES+=("$PACKAGE:$CURRENT_VERSION->$TARGET_VERSION")
     done
     
-    # If changes were made, commit and push
+    # Read the updated content and clean up temp file
+    UPDATED_CONTENT=$(cat "$TEMP_REQ")
+    rm -f "$TEMP_REQ"
+    
+    # If changes were made, push via GitHub Contents API
     if [ "$REPO_HAS_CHANGES" = true ]; then
         print_color "$CYAN" "---"
         print_color "$YELLOW" "Summary of changes in this repository:"
@@ -543,17 +522,15 @@ for REPO in $REPOS; do
             print_color "$YELLOW" "  • $PKG_NAME: $VERSIONS"
         done
         
-        # Show diff for review
+        # Show diff for review (unified diff of old vs new content)
+        print_color "$YELLOW" "\nChanges to be applied:"
+        diff -u --label "current" --label "updated" <(echo "$REQUIREMENTS_CONTENT") <(echo "$UPDATED_CONTENT") || true
+        echo
+        
         if [ "$AUTO_APPROVE" = true ]; then
-            # In auto-approve mode, show non-interactive diff
-            print_color "$YELLOW" "\nChanges to be applied:"
-            git --no-pager diff --color=always
             print_info "Auto-approve mode enabled. Proceeding with changes..."
             APPROVE="y"
         else
-            # In interactive mode, use regular diff (may use pager)
-            print_color "$YELLOW" "\nFull diff:"
-            git diff
             print_color "$YELLOW" "Approve these changes? (y/n): "
             read APPROVE
         fi
@@ -574,8 +551,12 @@ for REPO in $REPOS; do
                 COMMIT_MSG=$(echo "$COMMIT_MSG" | sed 's/, $//')
             fi
             
-            # Create a new branch for the update if using main strategy
+            # Base64 encode the updated content for the GitHub Contents API
+            ENCODED_CONTENT=$(printf '%s\n' "$UPDATED_CONTENT" | base64 | tr -d '\n')
+            
             if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
+                # Main branch strategy: create feature branch, update file via API, create PR
+                
                 # Generate branch name
                 if [ ${#UPDATED_PACKAGES[@]} -eq 1 ]; then
                     PKG_NAME=$(echo "${UPDATED_PACKAGES[0]}" | cut -d':' -f1)
@@ -585,70 +566,111 @@ for REPO in $REPOS; do
                     BRANCH_NAME="update-multiple-packages"
                 fi
                 
-                print_info "Using main branch strategy - will create PR for manual merge..."
-                git checkout -b "$BRANCH_NAME"
-            else
-                print_info "Using dev branch strategy - will commit directly to $WORKING_BRANCH..."
-                BRANCH_NAME="$WORKING_BRANCH"
-            fi
-            
-            # Commit changes
-            git add requirements.txt
-            git commit -m "$COMMIT_MSG"
-            
-            if [ "$USE_MAIN_STRATEGY" = true ] && [ "$WORKING_BRANCH" = "main" ]; then
-                # For main branch strategy: push feature branch and create PR
-                if git push -u origin "$BRANCH_NAME"; then
-                    print_success "Changes pushed to branch $BRANCH_NAME in $ORG/$REPO."
+                # Get main branch commit SHA to create the feature branch from
+                MAIN_SHA=$(gh api "repos/$ORG/$REPO/git/ref/heads/main" --jq '.object.sha' 2>/dev/null) || true
+                if [ -z "$MAIN_SHA" ]; then
+                    print_error "Failed to get main branch SHA. Skipping repository."
+                    continue
+                fi
+                
+                # Create feature branch from main via Refs API
+                print_info "Creating branch $BRANCH_NAME from main..."
+                CREATE_EXIT=0
+                CREATE_RESPONSE=$(gh api "repos/$ORG/$REPO/git/refs" \
+                    -X POST \
+                    -f "ref=refs/heads/$BRANCH_NAME" \
+                    -f "sha=$MAIN_SHA" 2>&1) || CREATE_EXIT=$?
+                
+                if [ $CREATE_EXIT -ne 0 ]; then
+                    if echo "$CREATE_RESPONSE" | grep -q "Reference already exists"; then
+                        print_warning "Branch $BRANCH_NAME already exists. Attempting to reuse..."
+                    else
+                        print_error "Failed to create branch $BRANCH_NAME: $CREATE_RESPONSE"
+                        continue
+                    fi
+                fi
+                
+                # Update requirements.txt on the feature branch via Contents API
+                print_info "Updating requirements.txt on branch $BRANCH_NAME via API..."
+                UPDATE_EXIT=0
+                UPDATE_RESPONSE=$(gh api "repos/$ORG/$REPO/contents/requirements.txt" \
+                    -X PUT \
+                    -f "message=$COMMIT_MSG" \
+                    -f "content=$ENCODED_CONTENT" \
+                    -f "sha=$FILE_SHA" \
+                    -f "branch=$BRANCH_NAME" 2>&1) || UPDATE_EXIT=$?
+                
+                if [ $UPDATE_EXIT -ne 0 ]; then
+                    if echo "$UPDATE_RESPONSE" | grep -q "409\|does not match"; then
+                        print_error "Conflict: requirements.txt was modified since we read it. Skipping repository."
+                    else
+                        print_error "Failed to update file via API: $UPDATE_RESPONSE"
+                    fi
+                    continue
+                fi
+                
+                print_success "File updated on branch $BRANCH_NAME in $ORG/$REPO."
+                
+                # Create a pull request
+                print_info "Creating pull request..."
+                PR_TITLE="$COMMIT_MSG"
+                
+                # Build PR body
+                PR_BODY="This PR updates the following packages:"$'\n\n'
+                for UPDATE in "${UPDATED_PACKAGES[@]}"; do
+                    PKG_NAME=$(echo "$UPDATE" | cut -d':' -f1)
+                    VERSIONS=$(echo "$UPDATE" | cut -d':' -f2)
+                    PR_BODY="${PR_BODY}- $PKG_NAME: $VERSIONS"$'\n'
+                done
+                
+                if PR_URL=$(gh pr create -R "$ORG/$REPO" --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME"); then
+                    print_pr_link "$PR_URL"
                     
-                    # Create a pull request
-                    print_info "Creating pull request..."
-                    PR_TITLE="$COMMIT_MSG"
+                    # Ask user if they want to merge the PR (or auto-merge if -y flag is set)
+                    MERGE_PR="n"
+                    if [ "$AUTO_APPROVE" = true ]; then
+                        print_info "Auto-approve mode enabled. Merging PR automatically..."
+                        MERGE_PR="y"
+                    else
+                        print_color "$YELLOW" "Do you want to merge this PR now? (y/n): "
+                        read MERGE_PR
+                    fi
                     
-                    # Build PR body
-                    PR_BODY="This PR updates the following packages:"$'\n\n'
-                    for UPDATE in "${UPDATED_PACKAGES[@]}"; do
-                        PKG_NAME=$(echo "$UPDATE" | cut -d':' -f1)
-                        VERSIONS=$(echo "$UPDATE" | cut -d':' -f2)
-                        PR_BODY="${PR_BODY}- $PKG_NAME: $VERSIONS"$'\n'
-                    done
-                    
-                    if PR_URL=$(gh pr create --title "$PR_TITLE" --body "$PR_BODY" --base main --head "$BRANCH_NAME"); then
-                        print_pr_link "$PR_URL"
-                        
-                        # Ask user if they want to merge the PR (or auto-merge if -y flag is set)
-                        MERGE_PR="n"
-                        if [ "$AUTO_APPROVE" = true ]; then
-                            print_info "Auto-approve mode enabled. Merging PR automatically..."
-                            MERGE_PR="y"
+                    if [ "$MERGE_PR" = "y" ] || [ "$MERGE_PR" = "Y" ]; then
+                        print_info "Merging pull request..."
+                        if gh pr merge "$PR_URL" --merge --delete-branch --admin; then
+                            print_success "PR merged successfully and branch deleted."
                         else
-                            print_color "$YELLOW" "Do you want to merge this PR now? (y/n): "
-                            read MERGE_PR
-                        fi
-                        
-                        if [ "$MERGE_PR" = "y" ] || [ "$MERGE_PR" = "Y" ]; then
-                            print_info "Merging pull request..."
-                            if gh pr merge "$PR_URL" --merge --delete-branch --admin; then
-                                print_success "PR merged successfully and branch deleted."
-                            else
-                                print_error "Failed to merge pull request. You may need to merge it manually."
-                            fi
-                        else
-                            print_color "$PURPLE" "Note: The PR has been created for manual review and merge."
+                            print_error "Failed to merge pull request. You may need to merge it manually."
                         fi
                     else
-                        print_error "Failed to create pull request."
+                        print_color "$PURPLE" "Note: The PR has been created for manual review and merge."
                     fi
                 else
-                    print_error "Failed to push changes to $ORG/$REPO."
+                    print_error "Failed to create pull request."
                 fi
             else
-                # For dev branch strategy: push directly to the branch
-                if git push origin "$WORKING_BRANCH"; then
-                    print_success "Changes pushed directly to $WORKING_BRANCH branch in $ORG/$REPO."
-                else
-                    print_error "Failed to push changes to $ORG/$REPO."
+                # Dev branch strategy: update file directly via Contents API
+                print_info "Updating requirements.txt directly on $WORKING_BRANCH via API..."
+                
+                UPDATE_EXIT=0
+                UPDATE_RESPONSE=$(gh api "repos/$ORG/$REPO/contents/requirements.txt" \
+                    -X PUT \
+                    -f "message=$COMMIT_MSG" \
+                    -f "content=$ENCODED_CONTENT" \
+                    -f "sha=$FILE_SHA" \
+                    -f "branch=$WORKING_BRANCH" 2>&1) || UPDATE_EXIT=$?
+                
+                if [ $UPDATE_EXIT -ne 0 ]; then
+                    if echo "$UPDATE_RESPONSE" | grep -q "409\|does not match"; then
+                        print_error "Conflict: requirements.txt was modified since we read it. Skipping repository."
+                    else
+                        print_error "Failed to update file via API: $UPDATE_RESPONSE"
+                    fi
+                    continue
                 fi
+                
+                print_success "Changes pushed directly to $WORKING_BRANCH branch in $ORG/$REPO."
             fi
         else
             print_warning "Changes not approved. Skipping."
